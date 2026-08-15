@@ -3,7 +3,10 @@
 //  Runs on Cloudflare Workers + D1
 //  Features: stats dashboard, search/filter/sort, bulk actions,
 //  CSV export, multi-admin roles, activity log, light/dark theme
+//  + VLESS-over-WebSocket proxy (uses existing user UUIDs)
 // ============================================================
+
+import { connect } from "cloudflare:sockets";
 
 function uuidv4() {
 	return crypto.randomUUID();
@@ -326,6 +329,183 @@ async function handlePublicStatus(request, env, uuid) {
 	});
 }
 
+// ============================================================
+//  VLESS-over-WebSocket proxy
+//  Uses the existing `users.uuid` column as the VLESS id.
+//  Each active, non-expired, under-quota user can connect.
+//  Path: wss://<worker-domain>/vless-ws
+// ============================================================
+
+const VLESS_WS_PATH = "/vless-ws";
+
+function bytesToUuid(bytes) {
+	const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+// Parses the VLESS request header. Returns null if malformed.
+// Layout: ver(1) + uuid(16) + optLen(1) + opt(optLen) + cmd(1) + port(2,BE) + atype(1) + addr + payload...
+function parseVlessHeader(buf) {
+	const view = new Uint8Array(buf);
+	if (view.length < 24) return null;
+	let offset = 0;
+	const version = view[offset]; offset += 1;
+	const uuid = bytesToUuid(view.slice(offset, offset + 16)); offset += 16;
+	const optLen = view[offset]; offset += 1;
+	offset += optLen;
+	const command = view[offset]; offset += 1; // 1 = TCP, 2 = UDP, we only support TCP
+	if (command !== 1) return null;
+	const port = (view[offset] << 8) | view[offset + 1]; offset += 2;
+	const addressType = view[offset]; offset += 1;
+	let address = "";
+	if (addressType === 1) {
+		// IPv4
+		address = view.slice(offset, offset + 4).join(".");
+		offset += 4;
+	} else if (addressType === 2) {
+		// domain
+		const len = view[offset]; offset += 1;
+		address = new TextDecoder().decode(view.slice(offset, offset + len));
+		offset += len;
+	} else if (addressType === 3) {
+		// IPv6
+		const parts = [];
+		for (let i = 0; i < 8; i++) {
+			parts.push(((view[offset] << 8) | view[offset + 1]).toString(16));
+			offset += 2;
+		}
+		address = parts.join(":");
+	} else {
+		return null;
+	}
+	const payload = view.slice(offset);
+	return { version, uuid, port, address, payload };
+}
+
+async function getActiveVlessUser(env, uuid) {
+	const user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(uuid).first();
+	if (!user || !user.is_active) return null;
+	if (user.limit_gb && user.used_gb >= user.limit_gb) return null;
+	if (user.expiry_days) {
+		const expiry = user.created_at + user.expiry_days * 86400000;
+		if (Date.now() > expiry) return null;
+	}
+	return user;
+}
+
+function handleVlessWebSocket(request, env, ctx) {
+	const pair = new WebSocketPair();
+	const client = pair[0];
+	const server = pair[1];
+	server.accept();
+
+	let remoteSocket = null;
+	let remoteWriter = null;
+	let vlessUser = null;
+	let headerParsed = false;
+	let bytesTotal = 0;
+	let closed = false;
+
+	const flushUsage = () => {
+		if (vlessUser && bytesTotal > 0) {
+			const gb = bytesTotal / (1024 * 1024 * 1024);
+			ctx.waitUntil(
+				env.DB.prepare("UPDATE users SET used_gb = used_gb + ? WHERE id = ?").bind(gb, vlessUser.id).run()
+			);
+			bytesTotal = 0;
+		}
+	};
+
+	const closeAll = () => {
+		if (closed) return;
+		closed = true;
+		flushUsage();
+		try { server.close(); } catch (e) {}
+		try { remoteSocket && remoteSocket.close(); } catch (e) {}
+	};
+
+	server.addEventListener("message", async (event) => {
+		try {
+			const data = event.data instanceof ArrayBuffer ? event.data : await new Response(event.data).arrayBuffer();
+
+			if (!headerParsed) {
+				const parsed = parseVlessHeader(data);
+				if (!parsed) return closeAll();
+
+				vlessUser = await getActiveVlessUser(env, parsed.uuid);
+				if (!vlessUser) return closeAll();
+
+				headerParsed = true;
+
+				remoteSocket = connect({ hostname: parsed.address, port: parsed.port });
+				remoteWriter = remoteSocket.writable.getWriter();
+
+				if (parsed.payload.length > 0) {
+					await remoteWriter.write(parsed.payload);
+					bytesTotal += parsed.payload.length;
+				}
+
+				// VLESS response header: version + 0 addons
+				server.send(new Uint8Array([parsed.version, 0]));
+
+				// pipe remote -> client
+				const reader = remoteSocket.readable.getReader();
+				(async () => {
+					try {
+						while (true) {
+							const { value, done } = await reader.read();
+							if (done) break;
+							bytesTotal += value.length;
+							server.send(value);
+						}
+					} catch (e) {}
+					closeAll();
+				})();
+			} else if (remoteWriter) {
+				const chunk = new Uint8Array(data);
+				await remoteWriter.write(chunk);
+				bytesTotal += chunk.length;
+			}
+		} catch (e) {
+			closeAll();
+		}
+	});
+
+	server.addEventListener("close", closeAll);
+	server.addEventListener("error", closeAll);
+
+	return new Response(null, { status: 101, webSocket: client });
+}
+
+function buildVlessLink(uuid, host, remark) {
+	const params = new URLSearchParams({
+		encryption: "none",
+		security: "tls",
+		type: "ws",
+		host,
+		path: VLESS_WS_PATH,
+		sni: host,
+	});
+	return `vless://${uuid}@${host}:443?${params.toString()}#${encodeURIComponent(remark)}`;
+}
+
+// Public endpoint: returns the VLESS link + a base64 subscription body for the given uuid.
+// Protected only by the UUID itself (same trust model as /api/status/:uuid).
+async function handleGetVlessConfig(request, env, uuid, url) {
+	const user = await env.DB.prepare("SELECT username FROM users WHERE uuid = ?").bind(uuid).first();
+	if (!user) return jsonResponse({ success: false, error: "کاربر پیدا نشد" }, 404);
+
+	const host = url.hostname; // e.g. fttworker-js.ftt-panel.workers.dev
+	const remark = `${env.PANEL_NAME || "FTT"}-${user.username}`;
+	const link = buildVlessLink(user.uuid || uuid, host, remark);
+
+	return jsonResponse({
+		success: true,
+		vless_link: link,
+		subscription_base64: btoa(link),
+	});
+}
+
 // ---------------- Router ----------------
 
 const WRITE_ACTIONS = new Set(["POST", "PATCH", "DELETE", "PUT"]);
@@ -334,6 +514,15 @@ export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 		const path = url.pathname;
+
+		// VLESS proxy upgrade
+		if (path === VLESS_WS_PATH && request.headers.get("Upgrade") === "websocket") {
+			return handleVlessWebSocket(request, env, ctx);
+		}
+
+		if (path.startsWith("/api/config/")) {
+			return handleGetVlessConfig(request, env, path.split("/api/config/")[1], url);
+		}
 
 		if (path.startsWith("/api/status/")) {
 			return handlePublicStatus(request, env, path.split("/api/status/")[1]);
@@ -644,6 +833,7 @@ async function loadUsers() {
       <td class="p-3"><input type="checkbox" class="row-check" value="\${u.id}" onchange="updateBulkBar()"></td>
       <td class="p-3 font-mono">\${u.username}
         <button onclick="copyStatusLink('\${u.uuid}')" title="کپی لینک وضعیت" class="opacity-50 hover:opacity-100 text-xs">🔗</button>
+        <button onclick="copyVlessConfig('\${u.uuid}')" title="کپی کانفیگ VLESS" class="opacity-50 hover:opacity-100 text-xs">⚡</button>
       </td>
       <td class="p-3">\${usedTxt}</td>
       <td class="p-3">\${expiryTxt}</td>
@@ -661,6 +851,18 @@ async function loadUsers() {
 function copyStatusLink(uuid) {
   const link = location.origin + '/status/' + uuid;
   navigator.clipboard.writeText(link).then(() => alert('لینک کپی شد'));
+}
+
+async function copyVlessConfig(uuid) {
+  try {
+    const res = await fetch('/api/config/' + uuid);
+    const data = await res.json();
+    if (!data.success) return alert(data.error || 'خطا در دریافت کانفیگ');
+    await navigator.clipboard.writeText(data.vless_link);
+    alert('کانفیگ VLESS کپی شد');
+  } catch (e) {
+    alert('خطا در دریافت کانفیگ');
+  }
 }
 
 function toggleSelectAll(cb) {
@@ -813,8 +1015,18 @@ function renderStatusPage(env) {
       <p class="text-sm text-slate-400 mb-1">روزهای باقیمانده</p>
       <p class="text-2xl font-bold mb-4">\${data.days_remaining === null ? 'نامحدود' : data.days_remaining + ' روز'}</p>
       <span class="px-3 py-1 rounded-full text-sm \${data.is_active ? 'bg-green-500/10 text-green-400 border border-green-500/30' : 'bg-red-500/10 text-red-400 border border-red-500/30'}">\${data.is_active ? 'فعال' : 'غیرفعال'}</span>
+      <div class="mt-4">
+        <button onclick="copyVless('\${uuid}')" class="text-xs px-3 py-2 rounded-lg border border-cyan-500/40 text-cyan-400 hover:bg-cyan-500/10 transition">کپی کانفیگ VLESS</button>
+      </div>
     \`;
   });
+  async function copyVless(uuid) {
+    const res = await fetch('/api/config/' + uuid);
+    const data = await res.json();
+    if (!data.success) return alert(data.error || 'خطا');
+    await navigator.clipboard.writeText(data.vless_link);
+    alert('کانفیگ کپی شد');
+  }
 </script>
 </body>
 </html>`;
