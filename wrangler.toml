@@ -1,3 +1,8 @@
 name = "fttworker-js"
 main = "worker.js"
 compatibility_date = "2026-08-15"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ftt_panel_db"
+database_id = "03269b44-e2d3-49c4-9cdd-90834db5aa9e"
