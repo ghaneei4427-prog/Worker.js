@@ -6,3 +6,7 @@ compatibility_date = "2026-08-15"
 binding = "DB"
 database_name = "ftt_panel_db"
 database_id = "03269b44-e2d3-49c4-9cdd-90834db5aa9e"
+
+[vars]
+ADMIN_USERNAME = "admin"
+PANEL_NAME = "FTT Panel"
